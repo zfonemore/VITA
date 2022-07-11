@@ -17,6 +17,13 @@ then run:
 python train_net_video.py --num-gpus 4 --config-file configs/youtubevis_2019/vita_r50.yaml MODEL.WEIGHTS PATH_TO_CocoPretrainedModel
 
 ```
+To test a VITA model, run:
+```
+
+python train_net_video.py --num-gpus 4 --config-file configs/youtubevis_2019/vita_r50.yaml --eval-only MODEL.WEIGHTS PATH_TO_CHECKPOINTS
+
+```
+
 
 ## License
 
