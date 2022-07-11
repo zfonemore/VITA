@@ -8,8 +8,15 @@ See [installation instructions](INSTALL.md).
 
 See [Preparing Datasets for Mask2Former](datasets/README.md).
 
-Run VITA code: 
-python train_net_video.py --num-gpus 4 --config-file configs/youtubevis_2019/vita_r50.yaml MODEL.WEIGHTS PATH_TO_COCOPRETRAINED_MODEL
+To train a VITA model, first
+setup the corresponding datasets following
+[datasets/README.md](./datasets/README.md),
+then run:
+```
+
+python train_net_video.py --num-gpus 4 --config-file configs/youtubevis_2019/vita_r50.yaml MODEL.WEIGHTS PATH_TO_CocoPretrainedModel
+
+```
 
 ## License
 
