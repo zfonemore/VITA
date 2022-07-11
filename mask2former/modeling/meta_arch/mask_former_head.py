@@ -112,13 +112,13 @@ class MaskFormerHead(nn.Module):
             ),
         }
 
-    def forward(self, features, mask=None):
-        return self.layers(features, mask)
+    def forward(self, features, mask=None, is_last=False):
+        return self.layers(features, mask, is_last)
 
-    def layers(self, features, mask=None):
+    def layers(self, features, mask=None, is_last=False):
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(features)
         if self.transformer_in_feature == "multi_scale_pixel_decoder":
-            predictions = self.predictor(multi_scale_features, mask_features, mask)
+            predictions = self.predictor(multi_scale_features, mask_features, mask, is_last)
         else:
             if self.transformer_in_feature == "transformer_encoder":
                 assert (

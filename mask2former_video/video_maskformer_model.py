@@ -179,31 +179,80 @@ class VideoMaskFormer(nn.Module):
         """
         images = []
         for video in batched_inputs:
+            self.num_frames = len(video["image"])
             for frame in video["image"]:
                 images.append(frame.to(self.device))
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+        #outputs = self.sem_seg_head(features)
 
+        clip_len, is_last  = 1, False
         if self.training:
             # mask classification target
-            targets = self.prepare_targets(batched_inputs, images)
+            targets = self.prepare_targets_clip(batched_inputs, images, clip_len)
 
-            # bipartite matching-based loss
-            losses = self.criterion(outputs, targets)
-
-            for k in list(losses.keys()):
-                if k in self.criterion.weight_dict:
-                    losses[k] *= self.criterion.weight_dict[k]
+            losses_all = {}
+            for frame in range(0, self.num_frames, clip_len):
+                if frame+clip_len < self.num_frames:
+                    indices = slice(frame, frame+clip_len, 1)
                 else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
-            return losses
+                    is_last = True
+                    frame = max(0, self.num_frames-clip_len)
+                    indices = slice(frame, self.num_frames, 1)
+
+                features_perframe = {}
+                for key in features.keys():
+                    features_perframe[key] = features[key][indices]
+                targets_perframe = [targets[frame // clip_len]]
+
+                outputs, outputs_video = self.sem_seg_head(features_perframe, is_last=is_last)
+
+                # bipartite matching-based loss
+                losses = self.criterion(outputs, targets_perframe)
+
+                for k in list(losses.keys()):
+                    if k in self.criterion.weight_dict:
+                        if k in losses_all:
+                            losses_all[k] += losses[k] * self.criterion.weight_dict[k]
+                        else:
+                            losses_all[k] = losses[k] * self.criterion.weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        losses.pop(k)
+            for k in list(losses.keys()):
+                losses_all[k] /= self.num_frames
+            targets = self.prepare_targets(batched_inputs, images)
+            losses_video = self.criterion(outputs_video, targets)
+            for k in list(losses_video.keys()):
+                    if k in self.criterion.weight_dict:
+                        if k in losses_all:
+                            losses_all[k] += losses_video[k] * self.criterion.weight_dict[k]
+                        else:
+                            losses_all[k] = losses_video[k] * self.criterion.weight_dict[k]
+                    else:
+                        # remove this loss if not specified in `weight_dict`
+                        losses.pop(k)
+
+            return losses_all
         else:
-            mask_cls_results = outputs["pred_logits"]
-            mask_pred_results = outputs["pred_masks"]
+            for frame in range(0, self.num_frames, clip_len):
+                if frame+clip_len < self.num_frames:
+                    indices = slice(frame, frame+clip_len, 1)
+                else:
+                    is_last = True
+                    frame = max(0, self.num_frames-clip_len)
+                    indices = slice(frame, self.num_frames, 1)
+
+                features_perframe = {}
+                for key in features.keys():
+                    features_perframe[key] = features[key][indices]
+
+                outputs, outputs_video = self.sem_seg_head(features_perframe, is_last=is_last)
+
+            mask_cls_results = outputs_video["pred_logits"]
+            mask_pred_results = outputs_video["pred_masks"]
 
             mask_cls_result = mask_cls_results[0]
             # upsample masks
@@ -215,6 +264,7 @@ class VideoMaskFormer(nn.Module):
             )
 
             del outputs
+            del outputs_video
 
             input_per_image = batched_inputs[0]
             image_size = images.image_sizes[0]  # image size without padding after data augmentation
@@ -249,6 +299,36 @@ class VideoMaskFormer(nn.Module):
             gt_instances.append({"labels": gt_classes_per_video, "ids": gt_ids_per_video})
             gt_masks_per_video = gt_masks_per_video[valid_idx].float()          # N, num_frames, H, W
             gt_instances[-1].update({"masks": gt_masks_per_video})
+
+        return gt_instances
+
+    def prepare_targets_clip(self, targets, images, clip_len):
+        h_pad, w_pad = images.tensor.shape[-2:]
+        gt_instances = []
+        for targets_per_video in targets:
+            _num_instance = len(targets_per_video["instances"][0])
+            for frame in range(0, self.num_frames, clip_len):
+                mask_shape = [_num_instance, clip_len, h_pad, w_pad]
+                gt_masks_per_clip = torch.zeros(mask_shape, dtype=torch.bool, device=self.device)
+
+                gt_ids_per_clip = []
+                for f_i in range(frame, frame+clip_len, 1):
+                    targets_per_frame = targets_per_video["instances"][f_i]
+                    targets_per_frame = targets_per_frame.to(self.device)
+                    h, w = targets_per_frame.image_size
+
+                    gt_ids_per_clip.append(targets_per_frame.gt_ids[:, None])
+                    gt_masks_per_clip[:, f_i-frame, :h, :w] = targets_per_frame.gt_masks.tensor
+
+                gt_ids_per_clip = torch.cat(gt_ids_per_clip, dim=1)
+                valid_idx = (gt_ids_per_clip != -1).any(dim=-1)
+
+                gt_classes_per_clip = targets_per_frame.gt_classes[valid_idx]          # N,
+                gt_ids_per_clip = gt_ids_per_clip[valid_idx]                          # N, num_frames
+
+                gt_instances.append({"labels": gt_classes_per_clip, "ids": gt_ids_per_clip})
+                gt_masks_per_clip = gt_masks_per_clip[valid_idx].float()          # N, num_frames, H, W
+                gt_instances[-1].update({"masks": gt_masks_per_clip})
 
         return gt_instances
 
