@@ -47,11 +47,11 @@ def window_partition(x, window_size):
         x: (B, H, W, C)
         window_size (int): window size
     Returns:
-        windows: (num_windows*B, window_size, window_size, C)
+        windows: (num_windows*B, window_size, C)
     """
     B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    x = x.view(B, H // window_size, window_size, W, C)
+    windows = x.permute(0, 1, 3, 2, 4).contiguous().view(-1, window_size, C)
     return windows
 
 
@@ -65,9 +65,9 @@ def window_reverse(windows, window_size, H, W):
     Returns:
         x: (B, H, W, C)
     """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    B = int(windows.shape[0] / (H * W / window_size))
+    x = windows.view(B, H // window_size, W, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4).contiguous().view(B, H, W, -1)
     return x
 
 
@@ -214,7 +214,7 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim,
-            window_size=to_2tuple(self.window_size),
+            window_size=(self.window_size, 1),
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             qk_scale=qk_scale,
@@ -249,14 +249,14 @@ class SwinTransformerBlock(nn.Module):
 
         # pad feature maps to multiples of window size
         pad_l = pad_t = 0
-        pad_r = (self.window_size - W % self.window_size) % self.window_size
+        pad_r = 0
         pad_b = (self.window_size - H % self.window_size) % self.window_size
         x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b))
         _, Hp, Wp, _ = x.shape
 
         # cyclic shift
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = torch.roll(x, shifts=(-self.shift_size), dims=(1))
             attn_mask = mask_matrix
         else:
             shifted_x = x
@@ -265,21 +265,21 @@ class SwinTransformerBlock(nn.Module):
         # partition windows
         x_windows = window_partition(
             shifted_x, self.window_size
-        )  # nW*B, window_size, window_size, C
+        )  # nW*B, window_size, C
         x_windows = x_windows.view(
-            -1, self.window_size * self.window_size, C
-        )  # nW*B, window_size*window_size, C
+            -1, self.window_size, C
+        )  # nW*B, window_size, C
 
         # W-MSA/SW-MSA
         attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
 
         # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        attn_windows = attn_windows.view(-1, self.window_size, C)
         shifted_x = window_reverse(attn_windows, self.window_size, Hp, Wp)  # B H' W' C
 
         # reverse cyclic shift
         if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            x = torch.roll(shifted_x, shifts=(self.shift_size), dims=(1))
         else:
             x = shifted_x
 
@@ -412,29 +412,23 @@ class BasicLayer(nn.Module):
 
         # calculate attention mask for SW-MSA
         Hp = int(np.ceil(H / self.window_size)) * self.window_size
-        Wp = int(np.ceil(W / self.window_size)) * self.window_size
-        img_mask = torch.zeros((1, Hp, Wp, 1), device=x.device)  # 1 Hp Wp 1
+        #Wp = int(np.ceil(W / self.window_size)) * self.window_size
+        img_mask = torch.zeros((1, Hp, W, 1), device=x.device)  # 1 Hp Wp 1
         h_slices = (
-            slice(0, -self.window_size),
-            slice(-self.window_size, -self.shift_size),
-            slice(-self.shift_size, None),
-        )
-        w_slices = (
             slice(0, -self.window_size),
             slice(-self.window_size, -self.shift_size),
             slice(-self.shift_size, None),
         )
         cnt = 0
         for h in h_slices:
-            for w in w_slices:
-                img_mask[:, h, w, :] = cnt
-                cnt += 1
+            img_mask[:, h, :, :] = cnt
+            cnt += 1
 
         mask_windows = window_partition(
             img_mask, self.window_size
-        )  # nW, window_size, window_size, 1
-        mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
-        attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+        )  # nW, window_size, 1
+        mask_windows = mask_windows.view(-1, self.window_size)
+        attn_mask = mask_windows.unsqueeze(1)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(
             attn_mask == 0, float(0.0)
         )

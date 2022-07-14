@@ -237,24 +237,6 @@ class VITA(nn.Module):
         self.num_heads = nheads
         self.num_layers = dec_layers
 
-        # linear layer change query into token
-        self.token_projector = nn.Linear(hidden_dim, hidden_dim)
-
-        # object_encoder use BasicLayer from swin transformer in swin.py
-        self.object_encoder = nn.ModuleList()
-        self.object_encoder.append(
-            BasicLayer(hidden_dim, 2,
-                self.num_heads, window_size=6)
-        )
-        self.object_encoder.append(
-            BasicLayer(hidden_dim, 2,
-                self.num_heads, window_size=6)
-        )
-        self.object_encoder.append(
-            BasicLayer(hidden_dim, 2,
-                self.num_heads, window_size=6)
-        )
-
         # mask2former frame-level decoder
         self.num_heads = nheads
         self.num_layers = dec_layers
@@ -299,12 +281,6 @@ class VITA(nn.Module):
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
-        # video-level query
-        # learnable query features
-        self.video_query_feat = nn.Embedding(num_queries, hidden_dim)
-        # learnable query p.e.
-        self.video_query_embed = nn.Embedding(num_queries, hidden_dim)
-
         # mask2former multiple level embedding (we always use 3 scales)
         self.num_feature_levels = 3
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
@@ -320,29 +296,6 @@ class VITA(nn.Module):
         if self.mask_classification:
             self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
-
-        # video decoder
-        dropout = 0.0
-        activation = 'relu'
-        normalize_before = pre_norm
-        # change self-attention and cross attention in this layer in transformer.py
-        decoder_layer = TransformerDecoderLayer(hidden_dim, nheads, dim_feedforward, dropout, activation, normalize_before)
-        decoder_norm = nn.LayerNorm(hidden_dim)
-
-        num_decoder_layers = 6
-        self.obj_decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
-                                        return_intermediate=True)
-        self.obj_pe_layer = PositionEmbeddingSine1D(N_steps, normalize=True)
-
-        self.video_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
-
-        self.video_decoder_norm = nn.LayerNorm(hidden_dim)
-        if self.mask_classification:
-            self.video_class_embed = nn.Linear(hidden_dim, num_classes + 1)
-
-        # store obj token and pixel embedding of each frame
-        self.obj_tokens = []
-        self.embeddings = []
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -402,8 +355,6 @@ class VITA(nn.Module):
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
 
-        #frame_query = self.query_feat.weight #torch.cat((output, query_embed), dim=2)
-
         predictions_class = []
         predictions_mask = []
 
@@ -411,6 +362,8 @@ class VITA(nn.Module):
         outputs_class, outputs_mask, attn_mask, _ = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+
+        frame_query = []
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -434,59 +387,26 @@ class VITA(nn.Module):
                 output
             )
 
+            if i >= 6:
+                frame_query.append(output)
+
             outputs_class, outputs_mask, attn_mask, decoder_output = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
 
         assert len(predictions_class) == self.num_layers + 1
 
-        # frame-level query to obj tokens
-        frame_query = output.squeeze(1)
-        obj_token = self.token_projector(frame_query)
-        self.obj_tokens.append(obj_token.unsqueeze(1))
-
-        # pixel embedding of each frame
-        self.embeddings.append(mask_features)
-
-        # the end of a video
-        if is_last:
-            obj_tokens = torch.cat(self.obj_tokens, dim=1)
-            for i in range(3):
-                obj_tokens, _, _, _, _, _ = self.object_encoder[i](obj_tokens, len(self.embeddings), 1)
-
-            query_embed = self.video_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-            output = self.video_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-
-            output = self.obj_decoder(output, obj_tokens,
-                        tgt_mask=None, memory_mask=None,
-                        pos=self.obj_pe_layer(obj_tokens), query_pos=query_embed)
-            outputs_class, outputs_mask = self.video_forward_prediction_heads(output[-1], self.embeddings, attn_mask_target_size=size_list[-1])
-
-            # set obj tokens and embeddings to empty for next video
-            self.obj_tokens = []
-            self.embeddings = []
-
-            video_out = {
-                'pred_logits': outputs_class,
-                'pred_masks': outputs_mask,
-                # here I do not use aux loss, you can use aux loss to compute loss for intermediate feature from obj_decoder
-                # to get intermediate feature from obj_decoer, set return_intermediate to True in TransformerDecoder
-                #self._set_aux_loss(
-                #    outputs_class if self.mask_classification else None, outputs_mask
-                #)
-            }
-        else:
-            video_out = None
-
         out = {
             'pred_logits': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_class if self.mask_classification else None, predictions_mask
-            )
+            ),
+            'frame_query': frame_query,
+            'mask_features': mask_features,
         }
 
-        return out, video_out
+        return out
 
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
@@ -549,5 +469,3 @@ class VITA(nn.Module):
             ]
         else:
             return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
-
-

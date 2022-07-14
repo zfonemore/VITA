@@ -14,9 +14,15 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 
+from mask2former.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 from .modeling.criterion import VideoSetCriterion
 from .modeling.matcher import VideoHungarianMatcher
 from .utils.memory import retry_if_cuda_oom
+
+
+from .modeling.transformer_decoder.swin import BasicLayer
+from .modeling.transformer_decoder.transformer_detr import TransformerEncoder, TransformerEncoderLayer, TransformerDecoder, TransformerDecoderLayer
+from .modeling.transformer_decoder.utils import MLP
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,53 @@ class VideoMaskFormer(nn.Module):
 
         self.num_frames = num_frames
 
+        hidden_dim = 256
+        nheads = 8
+        dropout = 0.0
+        activation = 'relu'
+        normalize_before = True
+        dim_feedforward = 2048
+
+        # video-level query
+        # learnable query features
+        self.video_query_feat = nn.Embedding(num_queries, hidden_dim)
+        # learnable query p.e.
+        self.video_query_embed = nn.Embedding(num_queries, hidden_dim)
+
+        # linear layer change query into token
+        self.token_projector = nn.Linear(hidden_dim, hidden_dim)
+
+        # object_encoder use BasicLayer from swin transformer in swin.py
+        encoder_layer = TransformerEncoderLayer(hidden_dim, nheads, dim_feedforward,
+                                                dropout, activation, normalize_before)
+        encoder_norm = nn.LayerNorm(hidden_dim)
+        self.object_encoder = TransformerEncoder(encoder_layer, 3, encoder_norm)
+        '''
+        for i in range(3):
+            self.object_encoder.append(
+                BasicLayer(hidden_dim, 2,
+                    self.num_heads, window_size=6)
+            )
+        '''
+
+        # video decoder
+        # change self-attention and cross attention in this layer in transformer.py
+        decoder_layer = TransformerDecoderLayer(hidden_dim, nheads, dim_feedforward, dropout, activation, normalize_before)
+        decoder_norm = nn.LayerNorm(hidden_dim)
+
+        num_decoder_layers = 6
+        self.obj_decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
+                                        return_intermediate=True)
+        N_steps = hidden_dim // 2
+        self.obj_pe_layer = PositionEmbeddingSine(N_steps, normalize=True)
+
+        mask_dim = 256
+        self.video_mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+
+        self.video_decoder_norm = nn.LayerNorm(hidden_dim)
+        self.video_class_embed = nn.Linear(hidden_dim, self.sem_seg_head.num_classes + 1)
+
+
     @classmethod
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
@@ -151,6 +204,71 @@ class VideoMaskFormer(nn.Module):
     def device(self):
         return self.pixel_mean.device
 
+    def video_forward_prediction_heads(self, output, mask_features, attn_mask_target_size=None):
+        decoder_output = self.video_decoder_norm(output)
+        decoder_output = decoder_output.transpose(0, 1)
+        outputs_class = self.video_class_embed(decoder_output)
+        mask_embed = self.video_mask_embed(decoder_output)
+
+        outputs_mask = torch.einsum("bqc,btchw->bqthw", mask_embed, mask_features)
+
+        '''
+        b, q, t, _, _ = outputs_mask.shape
+        # NOTE: prediction is of higher-resolution
+        # [B, Q, T, H, W] -> [B, Q, T*H*W] -> [B, h, Q, T*H*W] -> [B*h, Q, T*HW]
+        attn_mask = F.interpolate(outputs_mask.flatten(0, 1), size=attn_mask_target_size, mode="bilinear", align_corners=False).view(
+            b, q, t, attn_mask_target_size[0], attn_mask_target_size[1])
+        # must use bool type
+        # If a BoolTensor is provided, positions with ``True`` are not allowed to attend while ``False`` values will be unchanged.
+        attn_mask = (attn_mask.sigmoid().flatten(2).unsqueeze(1).repeat(1, self.num_heads, 1, 1).flatten(0, 1) < 0.5).bool()
+        attn_mask = attn_mask.detach()
+        '''
+
+        return outputs_class, outputs_mask #, attn_mask, decoder_output
+
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+        # this is a workaround to make torchscript happy, as torchscript
+        # doesn't support dictionary with non-homogeneous values, such
+        # as a dict having both a Tensor and a list.
+        if self.mask_classification:
+            return [
+                {"pred_logits": a, "pred_masks": b}
+                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+            ]
+        else:
+            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+
+
+    def video_process(self, frame_querys, mask_features):
+        frame_querys = torch.cat(frame_querys)
+        mask_features = torch.cat(mask_features, dim=1)
+        obj_tokens = self.token_projector(frame_querys)
+        T, q, bs = self.num_frames, self.num_queries, obj_tokens.size(1)
+        pos_obj = self.obj_pe_layer(torch.permute(obj_tokens.view(T, 3*q, bs, -1), (2, 3, 0, 1))).flatten(2).permute(2, 0, 1)
+        obj_tokens = self.object_encoder(obj_tokens, pos=pos_obj)
+
+        query_embed = self.video_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
+        output = self.video_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
+
+        output = self.obj_decoder(output, obj_tokens,
+                    tgt_mask=None, memory_mask=None,
+                    pos=pos_obj, query_pos=query_embed)
+        outputs_class, outputs_mask = self.video_forward_prediction_heads(output[-1], mask_features, attn_mask_target_size=None)
+
+        video_out = {
+            'pred_logits': outputs_class,
+            'pred_masks': outputs_mask,
+            # here I do not use aux loss, you can use aux loss to compute loss for intermediate feature from obj_decoder
+            # to get intermediate feature from obj_decoer, set return_intermediate to True in TransformerDecoder
+            #self._set_aux_loss(
+            #    outputs_class if self.mask_classification else None, outputs_mask
+            #)
+        }
+        return video_out
+
+
     def forward(self, batched_inputs):
         """
         Args:
@@ -178,6 +296,7 @@ class VideoMaskFormer(nn.Module):
                         Each dict contains keys "id", "category_id", "isthing".
         """
         images = []
+        batch_size= len(batched_inputs)
         for video in batched_inputs:
             self.num_frames = len(video["image"])
             for frame in video["image"]:
@@ -186,7 +305,6 @@ class VideoMaskFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        #outputs = self.sem_seg_head(features)
 
         clip_len, is_last  = 1, False
         if self.training:
@@ -194,20 +312,23 @@ class VideoMaskFormer(nn.Module):
             targets = self.prepare_targets_clip(batched_inputs, images, clip_len)
 
             losses_all = {}
+            frame_querys, mask_features = [], []
             for frame in range(0, self.num_frames, clip_len):
                 if frame+clip_len < self.num_frames:
-                    indices = slice(frame, frame+clip_len, 1)
+                    indices = slice(frame, frame+self.num_frames*(batch_size-1)+1, self.num_frames)
                 else:
                     is_last = True
                     frame = max(0, self.num_frames-clip_len)
-                    indices = slice(frame, self.num_frames, 1)
+                    indices = slice(frame, frame+self.num_frames*(batch_size-1)+1, self.num_frames)
 
                 features_perframe = {}
                 for key in features.keys():
                     features_perframe[key] = features[key][indices]
-                targets_perframe = [targets[frame // clip_len]]
+                targets_perframe = targets[indices]
 
-                outputs, outputs_video = self.sem_seg_head(features_perframe, is_last=is_last)
+                outputs = self.sem_seg_head(features_perframe, is_last=is_last)
+                frame_querys.append(torch.cat(outputs['frame_query']))
+                mask_features.append(outputs['mask_features'])
 
                 # bipartite matching-based loss
                 losses = self.criterion(outputs, targets_perframe)
@@ -219,10 +340,10 @@ class VideoMaskFormer(nn.Module):
                         else:
                             losses_all[k] = losses[k] * self.criterion.weight_dict[k]
                     else:
-                        # remove this loss if not specified in `weight_dict`
                         losses.pop(k)
             for k in list(losses.keys()):
                 losses_all[k] /= self.num_frames
+            outputs_video = self.video_process(frame_querys, mask_features)
             targets = self.prepare_targets(batched_inputs, images)
             losses_video = self.criterion(outputs_video, targets)
             for k in list(losses_video.keys()):
