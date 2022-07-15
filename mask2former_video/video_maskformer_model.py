@@ -138,6 +138,7 @@ class VideoMaskFormer(nn.Module):
 
         self.video_decoder_norm = nn.LayerNorm(hidden_dim)
         self.video_class_embed = nn.Linear(hidden_dim, self.sem_seg_head.num_classes + 1)
+        self.mask_classification = True
 
 
     @classmethod
@@ -240,13 +241,12 @@ class VideoMaskFormer(nn.Module):
         else:
             return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
 
-
     def video_process(self, frame_querys, mask_features):
         frame_querys = torch.cat(frame_querys)
         mask_features = torch.cat(mask_features, dim=1)
         obj_tokens = self.token_projector(frame_querys)
         T, q, bs = self.num_frames, self.num_queries, obj_tokens.size(1)
-        pos_obj = self.obj_pe_layer(torch.permute(obj_tokens.view(T, 3*q, bs, -1), (2, 3, 0, 1))).flatten(2).permute(2, 0, 1)
+        pos_obj = self.obj_pe_layer(obj_tokens.view(T, 3*q, bs, -1).permute(2, 3, 0, 1)).flatten(2).permute(2, 0, 1)
         obj_tokens = self.object_encoder(obj_tokens, pos=pos_obj)
 
         query_embed = self.video_query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
@@ -255,16 +255,22 @@ class VideoMaskFormer(nn.Module):
         output = self.obj_decoder(output, obj_tokens,
                     tgt_mask=None, memory_mask=None,
                     pos=pos_obj, query_pos=query_embed)
-        outputs_class, outputs_mask = self.video_forward_prediction_heads(output[-1], mask_features, attn_mask_target_size=None)
+
+        predictions_class = []
+        predictions_mask = []
+        for i in range(len(output)):
+            outputs_class, outputs_mask = self.video_forward_prediction_heads(output[i], mask_features, attn_mask_target_size=None)
+            predictions_class.append(outputs_class)
+            predictions_mask.append(outputs_mask)
 
         video_out = {
-            'pred_logits': outputs_class,
-            'pred_masks': outputs_mask,
+            'pred_logits': predictions_class[-1],
+            'pred_masks': predictions_mask[-1],
             # here I do not use aux loss, you can use aux loss to compute loss for intermediate feature from obj_decoder
             # to get intermediate feature from obj_decoer, set return_intermediate to True in TransformerDecoder
-            #self._set_aux_loss(
-            #    outputs_class if self.mask_classification else None, outputs_mask
-            #)
+            'aux_outputs': self._set_aux_loss(
+                predictions_class if self.mask_classification else None, predictions_mask
+            ),
         }
         return video_out
 
@@ -306,7 +312,7 @@ class VideoMaskFormer(nn.Module):
 
         features = self.backbone(images.tensor)
 
-        clip_len, is_last  = 1, False
+        clip_len = 1
         if self.training:
             # mask classification target
             targets = self.prepare_targets_clip(batched_inputs, images, clip_len)
@@ -317,7 +323,6 @@ class VideoMaskFormer(nn.Module):
                 if frame+clip_len < self.num_frames:
                     indices = slice(frame, frame+self.num_frames*(batch_size-1)+1, self.num_frames)
                 else:
-                    is_last = True
                     frame = max(0, self.num_frames-clip_len)
                     indices = slice(frame, frame+self.num_frames*(batch_size-1)+1, self.num_frames)
 
@@ -326,7 +331,7 @@ class VideoMaskFormer(nn.Module):
                     features_perframe[key] = features[key][indices]
                 targets_perframe = targets[indices]
 
-                outputs = self.sem_seg_head(features_perframe, is_last=is_last)
+                outputs = self.sem_seg_head(features_perframe)
                 frame_querys.append(torch.cat(outputs['frame_query']))
                 mask_features.append(outputs['mask_features'])
 
@@ -341,8 +346,10 @@ class VideoMaskFormer(nn.Module):
                             losses_all[k] = losses[k] * self.criterion.weight_dict[k]
                     else:
                         losses.pop(k)
+            '''
             for k in list(losses.keys()):
                 losses_all[k] /= self.num_frames
+            '''
             outputs_video = self.video_process(frame_querys, mask_features)
             targets = self.prepare_targets(batched_inputs, images)
             losses_video = self.criterion(outputs_video, targets)
@@ -358,19 +365,23 @@ class VideoMaskFormer(nn.Module):
 
             return losses_all
         else:
+            frame_querys, mask_features = [], []
             for frame in range(0, self.num_frames, clip_len):
                 if frame+clip_len < self.num_frames:
-                    indices = slice(frame, frame+clip_len, 1)
+                    indices = slice(frame, frame+1, 1)
                 else:
-                    is_last = True
                     frame = max(0, self.num_frames-clip_len)
-                    indices = slice(frame, self.num_frames, 1)
+                    indices = slice(frame, frame+1, 1)
 
                 features_perframe = {}
                 for key in features.keys():
                     features_perframe[key] = features[key][indices]
 
-                outputs, outputs_video = self.sem_seg_head(features_perframe, is_last=is_last)
+                outputs = self.sem_seg_head(features_perframe)
+                frame_querys.append(torch.cat(outputs['frame_query']))
+                mask_features.append(outputs['mask_features'])
+
+            outputs_video = self.video_process(frame_querys, mask_features)
 
             mask_cls_results = outputs_video["pred_logits"]
             mask_pred_results = outputs_video["pred_masks"]
